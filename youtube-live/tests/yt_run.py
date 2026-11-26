@@ -29,6 +29,7 @@ with sync_playwright() as p:
         if pg.evaluate("!!document.fullscreenElement"): pg.keyboard.press("f"); time.sleep(1.5)
         pg.locator("#movie_player").click(position={"x": 50, "y": 50}); pg.keyboard.press("f"); time.sleep(2)
     print("fullscreen:", pg.evaluate("!!document.fullscreenElement"), pg.evaluate("(() => { const p = document.querySelector('#movie_player'); return p.clientWidth + 'x' + p.clientHeight })()"))
+    if os.environ.get('MODE'): pg.evaluate(f"localStorage.setItem('smart1610.mode', '{os.environ['MODE']}')")
     pg.evaluate(script)
     if EXTRA_JS: pg.evaluate(EXTRA_JS)
     pg.evaluate(f"(async () => {{ const v = {V}; v.muted = true; await v.play(); }})()")
@@ -39,6 +40,7 @@ with sync_playwright() as p:
         vt = pg.evaluate(f"{V}.currentTime")
         on = [f"{r['x0']}-{r['x1']}x{r['y0']}-{r['y1']}" for r in st['rects'] if r['present'] and r['confirmed']]
         tx = st.get('text') or {}
+        if st.get('fill'): print(f"t={vt:6.1f} FILL height+{st['fill']['heightAdded']*100:.1f}% width-{st['fill']['widthRemoved']*100:.1f}% (best row seam {st['fill']['costH']}, col seam {st['fill']['costV']}) cam={'moving' if st['camMoving'] else 'still'}"); pg.screenshot(path=os.path.join(out, f"yt_{k:02d}.png")); continue
         print(f"t={vt:6.1f} crop L={st['trimL']*100:.1f}% R={st['trimR']*100:.1f}% squeeze={(st['maxSqueeze']-1)*100:.1f}% hud={st['hud']} "
               f"chat L={'PROT' if tx.get('L') else '-'} R={'PROT' if tx.get('R') else '-'} seams={st['seam']['carved']}/{st['seam']['K']} mix={st['seam']['mix']:.2f} cam={'moving' if st['camMoving'] else 'still'} layers={on}")
         pg.screenshot(path=os.path.join(out, f"yt_{k:02d}.png"))
