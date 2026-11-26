@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.0.0
+// @version      3.1.1
 // @description  Smart 16:9 -> 16:10 for YouTube: seam-carves plain areas on still shots, otherwise a smart crop that protects facecams, panels and chat. Alt+X smart/crop-only, Alt+Z on/off, Alt+Shift+Z debug.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,13 +27,14 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.0.0';
+  const VERSION = '3.1.1';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
     maxSqueezeShare: 0.3, // ...in which case at most 30% of the removal (3 of 10%) is even squeeze
     hudMinShare: 0.02,  // HUD on an edge = >= 2% of the outer band learned as overlay
     hudHoldMs: 10000,   // keep the HUD crop+squeeze mode this long after last seen
+    hudMinMoments: 60,  // ...and only decide there's HUD after this much motion history
     textBand: 0.12,     // chat/text detection looks at the outer 12% of each side
     textBandW: 160, textBandH: 360, // ...read at this resolution (~1.5 source px per px at 1080p)
     textBright: 150,    // glyph stroke brightness
@@ -45,8 +46,8 @@
     textMemRate: 0.01,  // how quickly the remembered chat location adapts
     textReleaseMs: 1500, // protection drops this long after the text is gone (bridges message bursts)
     textTau: 0.3,       // s, easing of the crop when chat appears / disappears
-    seamStillMs: 1000,  // camera still (and no cut) this long before seams are computed
-    seamMaxE: 0.3,      // a seam may only run through areas below 30% of the frame's average detail
+    seamStillMs: 600,   // camera still (and no cut) this long before seams are computed
+    seamMaxE: 0.4,      // a seam may only run through areas below 40% of the frame's average detail (busy gameplay ~0.5)
     seamTurnCost: 0.15, // extra cost per sideways step (straight seams leave a quieter trace)
     seamMotionW: 3,     // motion during the shot counts this much as detail (seams avoid movers)
     seamMotionDecay: 0.95, // per learn frame: motion memory of the current shot
@@ -59,6 +60,7 @@
     camOn: 0.35,        // share of changing pixels that means "camera moving"
     camOff: 0.2,        // ...and drops back to "still" below this
     camHoldMs: 3000,    // ...but only after no motion for this long
+    camStart: 0.28,     // camera score of a new shot: undecided
     ovCell: 4,          // overlay grid cell (analysis px)
     ovWindowMs: 1000,   // stillness = unchanged vs this long ago
     learnMinChange: 0.25, // learn only from moments where >= 25% of the frame changes
@@ -136,12 +138,12 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
     get state() {
-      return { enabled, active, fill, cuts, ok, camMoving, camScore, ovCells, ovInf, ovInfo, seam: { mode: seamMode, mix: seamMix, carved: seamCarved, K: seamK, ready: seamReady, log: seamLog }, text: { L: textProt.L, R: textProt.R, rowsL: textProt.rowsL, rowsR: textProt.rowsR }, hud: performance.now() < hudUntil, rects: ovRects.map((r) => ({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, present: r.present, confirmed: performance.now() - r.born >= CFG.ovConfirmMs })), prot: protNow ? Array.from(protNow) : null, maxSqueeze: 1 / warpMin, trimL: lay ? lay.L / CFG.aw : 0, trimR: lay ? lay.R / CFG.aw : 0,
+      return { enabled, active, fill, cuts, ok, camMoving, camScore, ovCells, ovInf, ovInfo, seam: { mode: seamMode, mix: seamMix, carved: seamCarved, K: seamK, ready: seamReady, log: seamLog, cropL: seamCL, cropR: seamCR }, text: { L: textProt.L, R: textProt.R, rowsL: textProt.rowsL, rowsR: textProt.rowsR }, hud: performance.now() < hudUntil, rects: ovRects.map((r) => ({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, present: r.present, confirmed: performance.now() - r.born >= CFG.ovConfirmMs })), prot: protNow ? Array.from(protNow) : null, maxSqueeze: 1 / warpMin, trimL: lay ? lay.L / CFG.aw : 0, trimR: lay ? lay.R / CFG.aw : 0,
                k: k ? Array.from(k) : null };
     },
     CFG,
@@ -597,7 +599,9 @@
     // is moving (pan, walk). Any uneven warp would then make things change
     // width as they slide across the screen, so only trim + even squeeze.
     // New shots start as "moving" (safe) until proven still.
-    if (cut || snap || prevY === null) { camScore = 0.5; camMoving = true; lastMoveT = now - CFG.camHoldMs; }
+    // New shot: start undecided (between the 'still' and 'moving' levels), so a
+    // still shot settles in a fraction of a second while motion still flips it.
+    if (cut || snap || prevY === null) { camScore = CFG.camStart; camMoving = true; lastMoveT = now - CFG.camHoldMs; }
     else if (movingFrac !== null) {
       const a = 1 - Math.exp(-dt / CFG.camTau);
       camScore += (movingFrac - camScore) * a;
@@ -713,7 +717,13 @@
         for (let x = aw - band; x < aw; x++) if (isL(row + x)) cr++;
       }
       const need = CFG.hudMinShare * band * ah;
-      if (cl >= need && cr >= need) hudUntil = now + CFG.hudHoldMs;
+      // Still footage (a press-conference backdrop) learns lots of "still"
+      // pixels everywhere - that isn't HUD. Only count it when the learned
+      // share of the whole frame is small and there's enough motion history.
+      let all = 0;
+      for (let q = 0; q < n; q++) if (isL(q)) all++;
+      const staticScene = all / n > CFG.ovStaticShare;
+      if (cl >= need && cr >= need && !staticScene && ovInf >= CFG.hudMinMoments) hudUntil = now + CFG.hudHoldMs;
     }
     res.hud = now < hudUntil;
     // Learned pixels -> groups (pixels within 2 px are connected; groups whose
@@ -957,7 +967,7 @@
     const cl = Math.round(rest * shareL), cr = rest - cl;
     const SW = LW - K, data = new Float32Array(SW * LH);
     for (let y = 0; y < LH; y++) for (let x = 0; x < SW; x++) data[y * SW + x] = (idx[y][x + cl] + 0.5) / LW;
-    seamW = SW; seamH = LH; seamCarved = carved; seamK = K;
+    seamW = SW; seamH = LH; seamCarved = carved; seamK = K; seamCL = cl / LW; seamCR = cr / LW;
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, seamTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, SW, LH, 0, gl.RED, gl.FLOAT, data);
@@ -1356,9 +1366,11 @@
     dbgEl.firstChild.textContent =
       `16:10 smart v${VERSION}  removing ${((1 - 1 / fill) * 100).toFixed(1)}% of width\n` +
       `mode ${seamMode === 'smart' ? 'SMART (seams on still shots)' : 'CROP only'} [Alt+X]  ` +
-      `seams: ${seamMix > 0.01 ? `${seamCarved} of ${seamK} columns carved, rest cropped (blend ${(seamMix * 100).toFixed(0)}%)` : 'off (crop)'}\n` +
+      `seams: ${seamMix > 0.01 ? `${seamCarved} of ${seamK} columns carved (blend ${(seamMix * 100).toFixed(0)}%)` : 'off (crop)'}\n` +
       `cuts ${cuts}   chat/text: ${textProt.L ? 'LEFT protected' : 'left -'} (${textProt.rowsL || 0} rows), ${textProt.R ? 'RIGHT protected' : 'right -'} (${textProt.rowsR || 0} rows)\n` +
-      `game layer: cropped L ${(100 * lay.L / n0).toFixed(1)}% R ${(100 * lay.R / n0).toFixed(1)}%, even squeeze ${((1 / warpMin - 1) * 100).toFixed(1)}%` +
+      (seamMix > 0.5
+        ? `on screen: seams remove ${(100 * seamCarved / CFG.aw / 2).toFixed(1)}%, cropped L ${(100 * seamCL).toFixed(1)}% R ${(100 * seamCR).toFixed(1)}%, squeeze 0%`
+        : `on screen: cropped L ${(100 * lay.L / n0).toFixed(1)}% R ${(100 * lay.R / n0).toFixed(1)}%, even squeeze ${((1 / warpMin - 1) * 100).toFixed(1)}%`) +
       `${performance.now() < hudUntil ? '  [HUD both edges: 7% crop + 3% squeeze]' : ''}  (camera ${camMoving ? 'moving' : 'still'})\n` +
       (ovInf < CFG.learnMinFrames
         ? `learning overlays... (${ovInf.toFixed(0)}/${CFG.learnMinFrames} moving moments)\n`

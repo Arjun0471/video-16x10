@@ -3,6 +3,7 @@ Usage: python3 tests/yt_run.py content.js URL SAMPLES [OUTDIR]"""
 import sys, time, os
 from playwright.sync_api import sync_playwright
 script = open(sys.argv[1]).read(); url = sys.argv[2]; n = int(sys.argv[3])
+EXTRA_JS = os.environ.get("EXTRA_JS", "")
 out = sys.argv[4] if len(sys.argv) > 4 else "."
 EXE = os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell")
 V = "document.querySelector('video.html5-main-video')"
@@ -29,6 +30,7 @@ with sync_playwright() as p:
         pg.locator("#movie_player").click(position={"x": 50, "y": 50}); pg.keyboard.press("f"); time.sleep(2)
     print("fullscreen:", pg.evaluate("!!document.fullscreenElement"), pg.evaluate("(() => { const p = document.querySelector('#movie_player'); return p.clientWidth + 'x' + p.clientHeight })()"))
     pg.evaluate(script)
+    if EXTRA_JS: pg.evaluate(EXTRA_JS)
     pg.evaluate(f"(async () => {{ const v = {V}; v.muted = true; await v.play(); }})()")
     pg.mouse.move(1900, 10)
     for k in range(n):
