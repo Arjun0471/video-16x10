@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.4.0
-// @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles: smart (seams on still shots + smart crop) / crop only / fill (never crops: adds height and removes width with seams). Alt+Z on/off, Alt+Shift+Z debug.
+// @version      3.5.0
+// @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles smart / crop only / fill (never crops); in fill, Alt+W switches seams / smooth warp. Alt+Z on/off, Alt+Shift+Z debug with seam view.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
 // @match        https://www.youtube-nocookie.com/embed/*
@@ -27,7 +27,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.4.0';
+  const VERSION = '3.5.0';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -58,6 +58,11 @@
                         // movements (a talking head) push row seams through the background (wavy logos)
     fillMotionMin: 28,  // ...ignoring changes below this (noise, compression, small talking movements)
     fillMotionDecay: 0.9, // ...remembered for a short while after they stop
+    warpEps: 0.15,      // warp style: plainness weight = 1 / (detail + this x frame mean)
+    warpMaxStretch: 1.0, // ...no spot stretched more than 2x
+    warpMaxShrink: 0.5, // ...or narrowed to less than half
+    warpSmoothX: 6,     // ...smoothing across neighbouring columns (analysis px): lines bend gently, never step
+    warpSmoothY: 2,     // ...and along each column
     fillSpread: 1.0,    // each chosen seam multiplies its neighbours' cost by up to (1 + this): plain areas stay
                         // cheap (bunching there is invisible), textured areas fill up fast and seams spread
     fillSpreadPx: 2,    // ...within this many analysis pixels, so seams spread out instead of bunching
@@ -151,7 +156,7 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, fillStyle = store.get('fillStyle', 'seams') === 'warp' ? 'warp' : 'seams', seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
@@ -1235,6 +1240,13 @@
     if (fillKH >= 0 && fillLF === lf && (!decideNow || splitCost(kH, kW) > 0.9 * splitCost(fillKH, fillKW))) {
       kH = Math.min(fillKH, KHmax); kW = Math.min(fillKW, KWmax);
     } else { fillKH = kH; fillKW = kW; fillSplitT = performance.now(); fillLF = lf; }
+    if (fillStyle === 'warp') {
+      const wm = warpMap(kH, kW, LW, LH, meanE);
+      uploadFill(wm.data, wm.W2, wm.H2, snapNow);
+      fillSeamV = null; fillSeamH = null;
+      fillInfo = { style: 'warp', kH, kW, heightAdded: kH / LH, widthRemoved: kW / LW, costH: +(costH[0] || 0).toFixed(3), costV: +(costV[0] || 0).toFixed(3) };
+      return;
+    }
     const sel = new Uint8Array(n), seamH = new Float32Array(n);
     for (let q = 0; q < kH; q++) { const path = pathsH[q]; for (let x = 0; x < LW; x++) { sel[path[x] * LW + x] = 1; seamH[path[x] * LW + x] = 1; } }
     // expanded column lists: source row (in rows, centre = r + 0.5) for each output row
@@ -1296,6 +1308,11 @@
       data[o + 1] = srcRow[c][y] / LH;
     }
     fillSeamV = seamV; fillSeamH = seamH;
+    uploadFill(data, W2, H2, snapNow);
+    fillInfo = { style: 'seams', kH, kW, heightAdded: kH / LH, widthRemoved: kW / LW, costH: +(costH[0] || 0).toFixed(3), costV: +(costV[0] || 0).toFixed(3) };
+  }
+
+  function uploadFill(data, W2, H2, snapNow) {
     // upload into the other slot and blend from the previous map
     const next = fillReady ? fillCur ^ 1 : fillCur;
     gl.activeTexture(gl.TEXTURE4 + next);
@@ -1309,7 +1326,97 @@
       fillSize[next ^ 1] = [W2, H2];
     }
     fillCur = next; fillT = performance.now(); fillReady = true;
-    fillInfo = { kH, kW, heightAdded: kH / LH, widthRemoved: kW / LW, costH: +(costH[0] || 0).toFixed(3), costV: +(costV[0] || 0).toFixed(3) };
+  }
+
+  // Smooth vertical/horizontal warp (alternative to seams): every column gets
+  // the same extra height, but places it in its own plainest parts; every row
+  // gives up the same width in its plainest parts. Smoothed across neighbours
+  // so lines bend gently instead of stepping. No path has to cross the frame.
+  function blurGrid(F, w, h, sx, sy) {
+    const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+    const kern = (sg) => { const r = Math.max(1, Math.ceil(sg * 2.5)), k = []; let t = 0;
+      for (let i = -r; i <= r; i++) { const v = Math.exp(-0.5 * (i / sg) ** 2); k.push(v); t += v; }
+      return { r, k: k.map((v) => v / t) }; };
+    const kx = kern(sx), ky = kern(sy);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let a = 0;
+      for (let i = -kx.r; i <= kx.r; i++) a += F[y * w + Math.min(w - 1, Math.max(0, x + i))] * kx.k[i + kx.r];
+      tmp[y * w + x] = a;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let a = 0;
+      for (let i = -ky.r; i <= ky.r; i++) a += tmp[Math.min(h - 1, Math.max(0, y + i)) * w + x] * ky.k[i + ky.r];
+      out[y * w + x] = a;
+    }
+    return out;
+  }
+  // spread `total` over cells in proportion to weights, no cell above `cap`
+  function distribute(total, wts, cap, out) {
+    const m = wts.length;
+    out.fill(0);
+    let remaining = total, free = new Array(m).fill(true);
+    for (let it = 0; it < 6 && remaining > 1e-6; it++) {
+      let ws = 0;
+      for (let i = 0; i < m; i++) if (free[i]) ws += wts[i];
+      if (ws <= 0) break;
+      let spill = 0;
+      for (let i = 0; i < m; i++) {
+        if (!free[i]) continue;
+        const v = out[i] + remaining * wts[i] / ws;
+        if (v >= cap) { spill += v - cap; out[i] = cap; free[i] = false; } else out[i] = v;
+      }
+      remaining = spill;
+    }
+  }
+  function warpMap(kH, kW, LW, LH, meanE) {
+    const E = fillE, eps = CFG.warpEps * meanE;
+    // --- vertical: stretch s(x, y) per source cell, each column sums to kH
+    let S = new Float32Array(LW * LH);
+    const col = new Float32Array(LH), sc = new Float32Array(LH);
+    for (let x = 0; x < LW; x++) {
+      for (let y = 0; y < LH; y++) col[y] = 1 / (E[y * LW + x] + eps);
+      distribute(kH, col, CFG.warpMaxStretch, sc);
+      for (let y = 0; y < LH; y++) S[y * LW + x] = sc[y];
+    }
+    S = blurGrid(S, LW, LH, CFG.warpSmoothX, CFG.warpSmoothY);
+    const H2 = LH + kH, rowMap = new Float32Array(LW * H2);
+    for (let x = 0; x < LW; x++) {
+      let t = 0;
+      for (let y = 0; y < LH; y++) t += S[y * LW + x];
+      const k = t > 0 ? kH / t : 0;
+      let b = 0, y = 0, sy = 1 + S[x] * k;
+      for (let j = 0; j < H2; j++) {
+        const c = j + 0.5;
+        while (y < LH - 1 && b + sy < c) { b += sy; y++; sy = 1 + S[y * LW + x] * k; }
+        rowMap[j * LW + x] = Math.min(LH, y + Math.min(1, (c - b) / sy));
+      }
+    }
+    // --- horizontal: shrink r(x, j) on the expanded rows, each row sums to kW
+    let Rm = new Float32Array(LW * H2);
+    const row = new Float32Array(LW), rr = new Float32Array(LW);
+    for (let j = 0; j < H2; j++) {
+      for (let x = 0; x < LW; x++) row[x] = 1 / (E[Math.min(LH - 1, Math.floor(rowMap[j * LW + x])) * LW + x] + eps);
+      distribute(kW, row, CFG.warpMaxShrink, rr);
+      for (let x = 0; x < LW; x++) Rm[j * LW + x] = rr[x];
+    }
+    Rm = blurGrid(Rm, LW, H2, CFG.warpSmoothY, CFG.warpSmoothX);
+    const W2 = LW - kW, data = new Float32Array(W2 * H2 * 2);
+    for (let j = 0; j < H2; j++) {
+      let t = 0;
+      for (let x = 0; x < LW; x++) t += Rm[j * LW + x];
+      const k = t > 0 ? kW / t : 0;
+      let b = 0, x = 0, wx = 1 - Math.min(0.95, Rm[j * LW] * k);
+      for (let i = 0; i < W2; i++) {
+        const c = i + 0.5;
+        while (x < LW - 1 && b + wx < c) { b += wx; x++; wx = 1 - Math.min(0.95, Rm[j * LW + x] * k); }
+        const sx = x + Math.min(1, (c - b) / wx);           // source column (cols)
+        const x0 = Math.min(LW - 1, Math.max(0, Math.floor(sx - 0.5))), x1 = Math.min(LW - 1, x0 + 1), f = Math.min(1, Math.max(0, sx - 0.5 - x0));
+        const sy = rowMap[j * LW + x0] * (1 - f) + rowMap[j * LW + x1] * f;
+        data[(j * W2 + i) * 2] = sx / LW;
+        data[(j * W2 + i) * 2 + 1] = sy / LH;
+      }
+    }
+    return { data, W2, H2 };
   }
 
   // ------------------------------------------------- chat / text on a side
@@ -1705,10 +1812,15 @@
     const L = [];
     L.push(`16:10 v${VERSION}   mode ${{ smart: 'SMART', crop: 'CROP ONLY', fill: 'FILL' }[seamMode]}  (Alt+X: smart / crop / fill)   camera ${camMoving ? 'moving' : 'still'}   cuts ${cuts}`);
     if (seamMode === 'fill') {
-      L.push(`FILL never crops: video shape changed with seams only`);
+      L.push(`FILL never crops: shape changed with ${fillStyle === 'warp' ? 'a SMOOTH WARP' : 'SEAMS'} (Alt+W: seams / warp)`);
       if (fillInfo) {
-        L.push(`  green = rows INSERTED   ${String(fillInfo.kH).padStart(2)} row seams    -> height +${pct(fillInfo.heightAdded)}   (cheapest row seam: ${fillInfo.costH} of avg detail)`);
-        L.push(`  red   = columns DELETED ${String(fillInfo.kW).padStart(2)} column seams -> width  -${pct(fillInfo.widthRemoved)}   (cheapest column seam: ${fillInfo.costV} of avg detail)`);
+        if (fillStyle === 'warp') {
+          L.push(`  green = stretched taller  -> height +${pct(fillInfo.heightAdded)}   (each column grows in its plainest parts)`);
+          L.push(`  red   = narrowed          -> width  -${pct(fillInfo.widthRemoved)}   (each row narrows in its plainest parts)`);
+        } else {
+          L.push(`  green = rows INSERTED   ${String(fillInfo.kH).padStart(2)} row seams    -> height +${pct(fillInfo.heightAdded)}   (cheapest row seam: ${fillInfo.costH} of avg detail)`);
+          L.push(`  red   = columns DELETED ${String(fillInfo.kW).padStart(2)} column seams -> width  -${pct(fillInfo.widthRemoved)}   (cheapest column seam: ${fillInfo.costV} of avg detail)`);
+        }
         L.push(`  picture enlarged ${pct(1 / (1 - fillInfo.widthRemoved) - 1)} (only deleted width enlarges); split re-decided every ${CFG.fillSplitMs / 1000}s, seams follow the picture 10x/s`);
       } else L.push(`  computing seams...`);
     } else {
@@ -1754,11 +1866,18 @@
   }
 
   document.addEventListener('keydown', (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey || (e.code !== 'KeyZ' && e.code !== 'KeyX')) return;
+    if (!e.altKey || e.ctrlKey || e.metaKey || !['KeyZ', 'KeyX', 'KeyW'].includes(e.code)) return;
     const el = e.target;
     if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
     e.preventDefault();
     e.stopPropagation();
+    if (e.code === 'KeyW') {                        // fill mode: seams <-> smooth warp
+      fillStyle = fillStyle === 'seams' ? 'warp' : 'seams';
+      store.set('fillStyle', fillStyle);
+      fillKH = -1; fillLastT = 0;
+      toast(`16:10 fill style: ${fillStyle === 'warp' ? 'smooth warp' : 'seams'}${seamMode === 'fill' ? '' : ' (applies in fill mode)'}`);
+      return;
+    }
     if (e.code === 'KeyX') {                        // smart (seams on still shots) <-> crop only
       seamMode = seamMode === 'smart' ? 'crop' : seamMode === 'crop' ? 'fill' : 'smart';
       store.set('mode', seamMode);
