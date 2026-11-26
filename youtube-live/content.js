@@ -17,7 +17,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '2.13.0';
+  const VERSION = '3.0.0';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -35,6 +35,13 @@
     textMemRate: 0.01,  // how quickly the remembered chat location adapts
     textReleaseMs: 1500, // protection drops this long after the text is gone (bridges message bursts)
     textTau: 0.3,       // s, easing of the crop when chat appears / disappears
+    seamStillMs: 1000,  // camera still (and no cut) this long before seams are computed
+    seamMaxE: 0.3,      // a seam may only run through areas below 30% of the frame's average detail
+    seamTurnCost: 0.15, // extra cost per sideways step (straight seams leave a quieter trace)
+    seamMotionW: 3,     // motion during the shot counts this much as detail (seams avoid movers)
+    seamMotionDecay: 0.95, // per learn frame: motion memory of the current shot
+    seamTau: 0.35,      // s, blend between seams and crop
+    seamEdgeBand: 0.04, // seams avoid the outer 4% at each side (left to the crop)
     camTau: 0.4,        // s, smoothing of the camera-motion score
     camWindowMs: 300,   // compare against the frame this far back
     settleMs: 1000,     // new shot: layout settles fast while it is classified
@@ -61,7 +68,9 @@
     ovMinPix: 40,       // ignore learned specks smaller than this (learn-grid px)
     ovMaxArea: 0.18,    // ...and anything covering more than 18% of the frame
     ovMinArea: 0.03,    // layers only for substantial overlays (facecams, panels)
+    ovMaxWidth: 0.4,    // ...no wider than 40% of the frame
     ovEdgeStill: 0.35,  // each stretch of an overlay's inner edges must be still >= 35% of the time
+    ovCornerSegs: 2,    // ...except up to 2 of 8 stretches at either end (a label narrower than its frame)
     ovOutsideStill: 0.65, // ...while just outside them it must be still <= 65% of the time (moving content)
     ovEdgeBand: 0.1,    // only overlays reaching into the outer 10% at either side get a layer
     ovMatchNcc: 0.6,    // an overlay is on screen if its pattern correlates >= 0.6 with its template
@@ -78,7 +87,7 @@
     spatialSigma: 10,   // columns, keeps any squeeze broad and gradual
     profileTau: 1.2,    // s, smoothing of importance over time
     mapTau: 1.0,        // s, how quickly the layout follows changes mid-shot
-    asymCost: 0.04,     // a fully one-sided trim must save >= 4% of importance
+    asymCost: 0.1,      // a fully one-sided crop must save >= 10% of importance (keeps it centred)
     deadCols: 3,        // layout ignores trim changes smaller than ~2% of width
     deadK: 0.08,        // ...and warp changes smaller than this
     cutDist: 0.55,      // colour-histogram L1 distance that counts as a cut
@@ -90,6 +99,7 @@
     set(k, v) { try { localStorage.setItem('smart1610.' + k, v); } catch { /* ignore */ } },
   };
   let enabled = store.get('enabled', '1') === '1';
+  let seamMode = store.get('mode', 'smart') === 'crop' ? 'crop' : 'smart';
   let debug = false;
 
   const style = document.createElement('style');
@@ -116,12 +126,12 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
     get state() {
-      return { enabled, active, fill, cuts, ok, camMoving, camScore, ovCells, ovInf, ovInfo, text: { L: textProt.L, R: textProt.R, rowsL: textProt.rowsL, rowsR: textProt.rowsR }, hud: performance.now() < hudUntil, rects: ovRects.map((r) => ({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, present: r.present, confirmed: performance.now() - r.born >= CFG.ovConfirmMs })), prot: protNow ? Array.from(protNow) : null, maxSqueeze: 1 / warpMin, trimL: lay ? lay.L / CFG.aw : 0, trimR: lay ? lay.R / CFG.aw : 0,
+      return { enabled, active, fill, cuts, ok, camMoving, camScore, ovCells, ovInf, ovInfo, seam: { mode: seamMode, mix: seamMix, carved: seamCarved, K: seamK, ready: seamReady, log: seamLog }, text: { L: textProt.L, R: textProt.R, rowsL: textProt.rowsL, rowsR: textProt.rowsR }, hud: performance.now() < hudUntil, rects: ovRects.map((r) => ({ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, present: r.present, confirmed: performance.now() - r.born >= CFG.ovConfirmMs })), prot: protNow ? Array.from(protNow) : null, maxSqueeze: 1 / warpMin, trimL: lay ? lay.L / CFG.aw : 0, trimR: lay ? lay.R / CFG.aw : 0,
                k: k ? Array.from(k) : null };
     },
     CFG,
@@ -144,6 +154,16 @@
     precision highp float;
     uniform sampler2D vid; uniform highp sampler2D lut; uniform int n; uniform vec2 texSize;
     uniform vec4 rects[8]; uniform float shifts[8]; uniform int nR; uniform float keep;
+    uniform highp sampler2D seam; uniform vec2 seamSize; uniform float seamMix;
+    // Seam map: per output row, the source x of every kept column (bilinear).
+    float seamX(vec2 q) {
+      vec2 pp = q * seamSize - .5, fr = fract(pp);
+      ivec2 i0 = ivec2(floor(pp)), mx = ivec2(seamSize) - 1;
+      ivec2 a = clamp(i0, ivec2(0), mx), b = clamp(i0 + 1, ivec2(0), mx);
+      float v00 = texelFetch(seam, ivec2(a.x, a.y), 0).r, v10 = texelFetch(seam, ivec2(b.x, a.y), 0).r;
+      float v01 = texelFetch(seam, ivec2(a.x, b.y), 0).r, v11 = texelFetch(seam, ivec2(b.x, b.y), 0).r;
+      return mix(mix(v00, v10, fr.x), mix(v01, v11, fr.x), fr.y);
+    }
     in vec2 uv; out vec4 o;
     vec4 catmullRom(vec2 p) {
       vec2 sp = p * texSize, t1 = floor(sp - .5) + .5, f = sp - t1;
@@ -171,7 +191,8 @@
       int i = int(floor(f));
       float a = texelFetch(lut, ivec2(i, 0), 0).r;
       float b = texelFetch(lut, ivec2(min(i + 1, n - 1), 0), 0).r;
-      vec2 sg = vec2(mix(a, b, f - float(i)), uv.y);              // game layer
+      vec2 sg = vec2(mix(a, b, f - float(i)), uv.y);              // game layer (crop)
+      if (seamMix > 0.001) sg.x = mix(sg.x, seamX(uv), seamMix);  // ...or seam-carved
       float p = uv.x * keep;                                      // output x in source units
       vec2 fpG = vec2(abs(dFdx(sg.x)), abs(dFdy(sg.y))) * texSize;
       vec2 fpR = vec2(abs(dFdx(p)), abs(dFdy(uv.y))) * texSize;
@@ -243,7 +264,7 @@
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    for (const [pr, names] of [[prog, ['vid', 'lut', 'n', 'texSize', 'rects[0]', 'shifts[0]', 'nR', 'keep']], [anaProg, ['vid', 'texSize', 'outSize', 'sub']]]) {
+    for (const [pr, names] of [[prog, ['vid', 'lut', 'n', 'texSize', 'rects[0]', 'shifts[0]', 'nR', 'keep', 'seam', 'seamSize', 'seamMix']], [anaProg, ['vid', 'texSize', 'outSize', 'sub']]]) {
       U[pr === prog ? 'r' : 'a'] = Object.fromEntries(names.map((nm) => [nm, gl.getUniformLocation(pr, nm)]));
     }
     anaSlots = {};
@@ -256,6 +277,13 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
+    seamTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, seamTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([0.5]));
+    seamReady = false;
     mapTex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, mapTex);
@@ -351,6 +379,17 @@
     gl.uniform1fv(U.r['shifts[0]'], sv);
     gl.uniform1i(U.r.nR, list.length);
     gl.uniform1f(U.r.keep, keep);
+    // seam blend eases in/out; snaps to 0 when the seams were invalidated by a cut
+    const tNow = performance.now(), sdt = Math.min(0.1, (tNow - (seamMixT || tNow)) / 1000);
+    seamMixT = tNow;
+    const target = seamReady && seamMode === 'smart' ? 1 : 0;
+    if (seamSnap) { seamMix = target; seamSnap = false; }
+    else seamMix += (target - seamMix) * (1 - Math.exp(-sdt / CFG.seamTau));
+    gl.uniform1i(U.r.seam, 3);
+    gl.uniform2f(U.r.seamSize, seamW || 1, seamH || 1);
+    gl.uniform1f(U.r.seamMix, seamMix);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, seamTex);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, mapTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, CFG.mapN, 1, gl.RED, gl.FLOAT, map);
@@ -529,6 +568,7 @@
       const Y2 = new Float32Array(n2);
       for (let q = 0, j = 0; q < n2; q++, j += 4) Y2[q] = 0.299 * d2[j] + 0.587 * d2[j + 1] + 0.114 * d2[j + 2];
       lastOv = learnOverlays(Y2, LW, LH, now, learnAcc);
+      updateSeams(Y2, LW, LH, now);
       learnAcc = 0; learnW = LW; learnH = LH;
     }
     if ((learnTick & 3) === 0) detectTextBands(now);
@@ -732,6 +772,7 @@
       const ar = (x1 + 1 - x0) * (y1 + 1 - y0);
       if (ar > CFG.ovMaxArea * aw * ah) continue;      // too big to be an overlay
       if (ar < CFG.ovMinArea * aw * ah) continue;      // small HUD bits: partial layers do more harm than good
+      if (x1 + 1 - x0 > CFG.ovMaxWidth * aw) continue;  // wide strips = merged HUD pieces, seam risk
       // Only overlays reaching into the outer band (where the crop cuts) need a
       // layer; anything further in is never cut, and drawing it only risks seams.
       if (x0 > CFG.ovEdgeBand * aw && x1 < (1 - CFG.ovEdgeBand) * aw) continue;
@@ -801,6 +842,116 @@
     }
     res.rects = ovRects.filter((r) => r.present && now - r.born >= CFG.ovConfirmMs).slice(0, CFG.ovMaxRects);
     return res;
+  }
+
+  // ------------------------------------------------------- seam carving
+  // On still shots, remove pixels along seams: connected top-to-bottom paths
+  // that wind through the emptiest parts of the picture (sky, walls, flat
+  // background), around detail, anything that moved during the shot, overlays
+  // and chat. Objects keep their exact proportions and the edges stay. Seams
+  // are computed once per still shot and then frozen (no wobble); only as many
+  // as the empty areas allow - the rest of the 10% comes from the usual crop.
+  function updateSeams(Y, LW, LH, now) {
+    const n = LW * LH;
+    if (!motAcc || motAcc.length !== n) { motAcc = new Float32Array(n); prevY2 = null; }
+    if (prevY2 && prevY2.length === n) {
+      for (let q = 0; q < n; q++) motAcc[q] = motAcc[q] * CFG.seamMotionDecay + Math.abs(Y[q] - prevY2[q]);
+    }
+    prevY2 = Y;
+    const K = Math.round((1 - 1 / fill) * LW);
+    const cutRecently = now - lastCutT < CFG.seamStillMs;
+    if (cutRecently && (seamReady || seamShotDone)) { seamReady = false; seamShotDone = false; seamSnap = true; motAcc.fill(0); }
+    if (camMoving && seamReady) { seamReady = false; seamShotDone = false; }   // eases back to the crop
+    if (!camMoving && camMoving !== seamPrevMoving) seamStillT = now;
+    seamPrevMoving = camMoving;
+    if (seamMode !== 'smart' || seamShotDone || camMoving || cutRecently || K < 1) return;
+    if (now - seamStillT < CFG.seamStillMs) return;
+    computeSeams(Y, LW, LH, K);
+    seamShotDone = true;
+  }
+
+  function computeSeams(Y, LW, LH, K) {
+    const n = LW * LH, E = new Float32Array(n);
+    // Detail at double resolution (tile edges, fine texture and text count),
+    // max-pooled onto the seam grid; read once per shot.
+    const HW = LW * 2, HH = LH * 2, d = readAnalysis(HW, HH, 'seamhi');
+    const H = new Float32Array(HW * HH);
+    for (let q = 0, j = 0; q < HW * HH; q++, j += 4) H[q] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    let sum = 0;
+    for (let y = 0; y < LH; y++) {
+      for (let x = 0; x < LW; x++) {
+        let g = 0;
+        for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+          const hx = x * 2 + dx, hy = y * 2 + dy, h = hy * HW + hx;
+          const gx = hx < HW - 1 ? Math.abs(H[h + 1] - H[h]) : 0, gy = hy < HH - 1 ? Math.abs(H[h + HW] - H[h]) : 0;
+          g = Math.max(g, gx + gy);
+        }
+        const q = y * LW + x;
+        E[q] = g + CFG.seamMotionW * motAcc[q];
+        sum += E[q];
+      }
+    }
+    const meanE = sum / n || 1;
+    for (const r of ovActive || []) for (let y = r.y0; y < r.y1; y++) for (let x = r.x0; x < r.x1; x++) E[y * LW + x] += 1e4;
+    // Text found along a side edge (chat, HUD labels): seams must not pass between
+    // its letters, which look empty at this resolution.
+    const band = Math.round(CFG.textBand * LW);
+    for (const side of ['L', 'R']) {
+      const mem = textMem[side];
+      if (!mem) continue;
+      for (let y = 0; y < LH; y++) {
+        const r0 = Math.floor(y * mem.length / LH), r1 = Math.floor((y + 1) * mem.length / LH);
+        let m = 0;
+        for (let r = r0; r < Math.max(r1, r0 + 1); r++) m = Math.max(m, mem[Math.min(mem.length - 1, r)]);
+        if (m < 0.05) continue;
+        const xa = side === 'L' ? 0 : LW - band, xb = side === 'L' ? band : LW;
+        for (let x = xa; x < xb; x++) E[y * LW + x] += 1e4;
+      }
+    }
+    // Keep seams off the frame edges (they'd zigzag through edge content);
+    // the crop takes care of the edges.
+    const edge = Math.round(CFG.seamEdgeBand * LW);
+    for (let y = 0; y < LH; y++) for (let x = 0; x < edge; x++) { E[y * LW + x] += meanE; E[y * LW + LW - 1 - x] += meanE; }
+    // remaining source columns per row
+    const idx = [];
+    for (let y = 0; y < LH; y++) { const a = new Int16Array(LW); for (let x = 0; x < LW; x++) a[x] = x; idx.push(a); }
+    let w = LW, carved = 0;
+    seamLog = [];
+    const turn = CFG.seamTurnCost * meanE;
+    const M = new Float32Array(LW * LH), back = new Int8Array(LW * LH), path = new Int16Array(LH);
+    for (; carved < K; carved++) {
+      for (let x = 0; x < w; x++) M[x] = E[idx[0][x]];
+      for (let y = 1; y < LH; y++) {
+        const row = idx[y], o = y * LW, po = (y - 1) * LW;
+        for (let x = 0; x < w; x++) {
+          let b = 0, m = M[po + x];
+          if (x > 0 && M[po + x - 1] + turn < m) { m = M[po + x - 1] + turn; b = -1; }
+          if (x < w - 1 && M[po + x + 1] + turn < m) { m = M[po + x + 1] + turn; b = 1; }
+          M[o + x] = E[o + row[x]] + m;
+          back[o + x] = b;
+        }
+      }
+      let bx = 0, bm = Infinity;
+      const lo = (LH - 1) * LW;
+      for (let x = 0; x < w; x++) if (M[lo + x] < bm) { bm = M[lo + x]; bx = x; }
+      seamLog.push(+(bm / LH / meanE).toFixed(3));
+      if (bm / LH > CFG.seamMaxE * meanE) break;     // no more empty paths: crop the rest
+      for (let y = LH - 1; y >= 0; y--) { path[y] = bx; if (y > 0) bx += back[y * LW + bx]; }
+      for (let y = 0; y < LH; y++) { const row = idx[y]; row.copyWithin(path[y], path[y] + 1, w); }
+      w--;
+    }
+    // the rest of the removal: crop from the edges (respecting chat protection)
+    const rest = K - carved;
+    let shareL = lay && lay.L + lay.R > 0 ? lay.L / (lay.L + lay.R) : 0.5;
+    if (textProt.L && !textProt.R) shareL = 0; else if (textProt.R && !textProt.L) shareL = 1;
+    const cl = Math.round(rest * shareL), cr = rest - cl;
+    const SW = LW - K, data = new Float32Array(SW * LH);
+    for (let y = 0; y < LH; y++) for (let x = 0; x < SW; x++) data[y * SW + x] = (idx[y][x + cl] + 0.5) / LW;
+    seamW = SW; seamH = LH; seamCarved = carved; seamK = K;
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, seamTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, SW, LH, 0, gl.RED, gl.FLOAT, data);
+    seamReady = carved > 0;                          // nothing carvable = plain crop
   }
 
   // ------------------------------------------------- chat / text on a side
@@ -878,6 +1029,8 @@
       const first = ok.indexOf(true), last = ok.lastIndexOf(true);
       if (first < 0) return false;                     // the whole edge is moving
       for (let q = first; q <= last; q++) if (!ok[q]) return false;
+      // moving stretches only at the very ends (a label's corner), not more
+      if (first > CFG.ovCornerSegs || ok.length - 1 - last > CFG.ovCornerSegs) return false;
       return true;
     };
     const across = (x, y, horiz) => {               // max stillness across the line
@@ -1192,6 +1345,8 @@
     const n0 = k.length;
     dbgEl.firstChild.textContent =
       `16:10 smart v${VERSION}  removing ${((1 - 1 / fill) * 100).toFixed(1)}% of width\n` +
+      `mode ${seamMode === 'smart' ? 'SMART (seams on still shots)' : 'CROP only'} [Alt+X]  ` +
+      `seams: ${seamMix > 0.01 ? `${seamCarved} of ${seamK} columns carved, rest cropped (blend ${(seamMix * 100).toFixed(0)}%)` : 'off (crop)'}\n` +
       `cuts ${cuts}   chat/text: ${textProt.L ? 'LEFT protected' : 'left -'} (${textProt.rowsL || 0} rows), ${textProt.R ? 'RIGHT protected' : 'right -'} (${textProt.rowsR || 0} rows)\n` +
       `game layer: cropped L ${(100 * lay.L / n0).toFixed(1)}% R ${(100 * lay.R / n0).toFixed(1)}%, even squeeze ${((1 / warpMin - 1) * 100).toFixed(1)}%` +
       `${performance.now() < hudUntil ? '  [HUD both edges: 7% crop + 3% squeeze]' : ''}  (camera ${camMoving ? 'moving' : 'still'})\n` +
@@ -1232,11 +1387,18 @@
   }
 
   document.addEventListener('keydown', (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey || e.code !== 'KeyZ') return;
+    if (!e.altKey || e.ctrlKey || e.metaKey || (e.code !== 'KeyZ' && e.code !== 'KeyX')) return;
     const el = e.target;
     if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
     e.preventDefault();
     e.stopPropagation();
+    if (e.code === 'KeyX') {                        // smart (seams on still shots) <-> crop only
+      seamMode = seamMode === 'smart' ? 'crop' : 'smart';
+      store.set('mode', seamMode);
+      if (seamMode === 'smart') seamShotDone = false;
+      toast(`16:10 mode: ${seamMode === 'smart' ? 'smart (seams)' : 'crop only'}`);
+      return;
+    }
     if (e.shiftKey) {
       debug = !debug;
       if (!debug && dbgEl) { dbgEl.remove(); dbgEl = null; }

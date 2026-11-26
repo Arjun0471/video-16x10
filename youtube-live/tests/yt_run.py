@@ -38,6 +38,7 @@ with sync_playwright() as p:
         on = [f"{r['x0']}-{r['x1']}x{r['y0']}-{r['y1']}" for r in st['rects'] if r['present'] and r['confirmed']]
         tx = st.get('text') or {}
         print(f"t={vt:6.1f} crop L={st['trimL']*100:.1f}% R={st['trimR']*100:.1f}% squeeze={(st['maxSqueeze']-1)*100:.1f}% hud={st['hud']} "
-              f"chat L={'PROT' if tx.get('L') else '-'}({tx.get('rowsL')}) R={'PROT' if tx.get('R') else '-'}({tx.get('rowsR')}) layers={on}")
+              f"chat L={'PROT' if tx.get('L') else '-'} R={'PROT' if tx.get('R') else '-'} seams={st['seam']['carved']}/{st['seam']['K']} mix={st['seam']['mix']:.2f} cam={'moving' if st['camMoving'] else 'still'} layers={on}")
         pg.screenshot(path=os.path.join(out, f"yt_{k:02d}.png"))
+    print('seam energy log (avg seam detail / frame mean):', pg.evaluate('window.__smart1610.state.seam.log'))
     b.close()
