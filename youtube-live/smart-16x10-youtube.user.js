@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.5.1
+// @version      3.5.2
 // @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles smart / crop only / fill (never crops); in fill, Alt+W switches seams / smooth warp. Alt+Z on/off, Alt+Shift+Z debug with seam view.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,7 +27,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.5.1';
+  const VERSION = '3.5.2';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -60,6 +60,7 @@
     fillMotionDecay: 0.9, // ...remembered for a short while after they stop
     skinW: 20,          // skin (faces, hands) counts as this much detail (x frame mean): no stretch there
     skinMinY: 50, skinCr: [135, 175], skinCb: [80, 130], // YCbCr skin range
+    skinHeadUp: 0.6,    // also protect hair: this x the face's height above it
     skinDilate: 2,      // grow the skin mask by this many analysis px (hairline, edges of the face)
     warpEps: 0.15,      // warp style: plainness weight = 1 / (detail + this x frame mean)
     warpMaxStretch: 1.0, // ...no spot stretched more than 2x
@@ -1071,7 +1072,7 @@
       const r = d[j], g = d[j + 1], b = d[j + 2];
       const y = 0.299 * r + 0.587 * g + 0.114 * b;
       const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b, cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-      if (y > CFG.skinMinY && cr > CFG.skinCr[0] && cr < CFG.skinCr[1] && cb > CFG.skinCb[0] && cb < CFG.skinCb[1]) { m[q] = 1; cnt++; }
+      if (y > CFG.skinMinY && r > g && g >= b && r - b > 15 && cr > CFG.skinCr[0] && cr < CFG.skinCr[1] && cb > CFG.skinCb[0] && cb < CFG.skinCb[1]) { m[q] = 1; cnt++; }
     }
     skinShare = cnt / n;
     const R = CFG.skinDilate, out = new Uint8Array(n);
@@ -1080,6 +1081,18 @@
       for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
         const yy = y + dy, xx = x + dx;
         if (yy >= 0 && yy < LH && xx >= 0 && xx < LW) out[yy * LW + xx] = 1;
+      }
+    }
+    // hair: above each vertical run of skin (a face), protect another
+    // skinHeadUp x its length - hair isn't skin-coloured but stretches badly
+    for (let x = 0; x < LW; x++) {
+      let y = 0;
+      while (y < LH) {
+        if (!m[y * LW + x]) { y++; continue; }
+        let e = y; while (e < LH && m[e * LW + x]) e++;
+        const up = Math.round((e - y) * CFG.skinHeadUp);
+        if (e - y >= 3) for (let k = Math.max(0, y - up); k < y; k++) out[k * LW + x] = 1;
+        y = e;
       }
     }
     return out;
@@ -1409,6 +1422,16 @@
       for (let y = 0; y < LH; y++) S[y * LW + x] = sc[y];
     }
     S = blurGrid(S, LW, LH, CFG.warpSmoothX, CFG.warpSmoothY);
+    // smoothing would leak stretch back into faces: hard zero there (the
+    // column total is renormalised below, so the plain parts take it)
+    // (soft edge: a blurred mask, fully zero inside, fading out at the border)
+    let prot = null;
+    if (skinMask && skinMask.length === LW * LH) {
+      const P = new Float32Array(LW * LH);
+      for (let q = 0; q < P.length; q++) P[q] = skinMask[q];
+      prot = blurGrid(P, LW, LH, 2, 2);
+      for (let q = 0; q < P.length; q++) S[q] *= Math.max(0, 1 - 1.6 * prot[q]);
+    }
     const H2 = LH + kH, rowMap = new Float32Array(LW * H2);
     for (let x = 0; x < LW; x++) {
       let t = 0;
@@ -1430,6 +1453,8 @@
       for (let x = 0; x < LW; x++) Rm[j * LW + x] = rr[x];
     }
     Rm = blurGrid(Rm, LW, H2, CFG.warpSmoothY, CFG.warpSmoothX);
+    if (prot) for (let j = 0; j < H2; j++) for (let x = 0; x < LW; x++)
+      Rm[j * LW + x] *= Math.max(0, 1 - 1.6 * prot[Math.min(LH - 1, Math.floor(rowMap[j * LW + x])) * LW + x]);
     const W2 = LW - kW, data = new Float32Array(W2 * H2 * 2);
     for (let j = 0; j < H2; j++) {
       let t = 0;
