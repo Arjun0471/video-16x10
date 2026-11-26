@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.3.0
+// @version      3.4.0
 // @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles: smart (seams on still shots + smart crop) / crop only / fill (never crops: adds height and removes width with seams). Alt+Z on/off, Alt+Shift+Z debug.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,7 +27,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.3.0';
+  const VERSION = '3.4.0';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -54,6 +54,13 @@
     seamTau: 0.35,      // s, blend between seams and crop
     fillHeightBias: 0.75, // fill mode: row-seam costs count 25% less (prefer added height over removed width)
     fillSplitMs: 2000,  // re-decide the height/width split at most this often (or at a cut)
+    fillMotionW: 0,     // moving things (camera motion removed) count this much as detail. Off: even small
+                        // movements (a talking head) push row seams through the background (wavy logos)
+    fillMotionMin: 28,  // ...ignoring changes below this (noise, compression, small talking movements)
+    fillMotionDecay: 0.9, // ...remembered for a short while after they stop
+    fillSpread: 1.0,    // each chosen seam multiplies its neighbours' cost by up to (1 + this): plain areas stay
+                        // cheap (bunching there is invisible), textured areas fill up fast and seams spread
+    fillSpreadPx: 2,    // ...within this many analysis pixels, so seams spread out instead of bunching
     fillEnergyRate: 0.25, // per learn frame: how fast the (camera-compensated) detail map follows the picture
     fillSticky: 0.6,    // last layout's seams are this much (x frame mean detail) cheaper
     fillRecomputeMs: 100, // recompute the seam layout this often
@@ -144,7 +151,7 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
@@ -1089,6 +1096,40 @@
       dx = estShift(colMeans(Y, LW, LH), colMeans(fillPrevY, LW, LH), 12);
       dy = estShift(rowMeans(Y, LW, LH), rowMeans(fillPrevY, LW, LH), 8);
     }
+    // things moving in the picture (after removing the camera's own motion)
+    // repel seams, so people and players aren't stretched or squeezed
+    const mot = new Float32Array(n);
+    if (fillPrevY && fillPrevY.length === n && !cut) {
+      for (let y = 0; y < LH; y++) {
+        const sy = Math.min(LH - 1, Math.max(0, y - dy));
+        for (let x = 0; x < LW; x++) {
+          const d = Math.abs(Y[y * LW + x] - fillPrevY[sy * LW + Math.min(LW - 1, Math.max(0, x - dx))]);
+          mot[y * LW + x] = d > CFG.fillMotionMin ? d : 0;
+        }
+      }
+    }
+    if (!fillMot || fillMot.length !== n || cut) fillMot = mot;
+    else {
+      fillMot = shiftField(fillMot, LW, LH, dx, dy);
+      for (let q = 0; q < n; q++) fillMot[q] = Math.max(fillMot[q] * CFG.fillMotionDecay, mot[q]);
+    }
+    for (let q = 0; q < n; q++) E[q] += CFG.fillMotionW * fillMot[q];
+    // chat/edge text: seams must go around text lines, not through them
+    const tband = Math.round(CFG.textBand * LW);
+    for (const side of ['L', 'R']) {
+      const mem = textMem[side];
+      if (!mem || !textProt[side]) continue;          // only while chat is actually on screen
+      for (let y = 0; y < LH; y++) {
+        const r0 = Math.floor(y * mem.length / LH), r1 = Math.max(r0 + 1, Math.floor((y + 1) * mem.length / LH));
+        let m = 0;
+        for (let r = r0; r < r1; r++) m = Math.max(m, mem[Math.min(mem.length - 1, r)]);
+        if (m < 0.05) continue;
+        // chat lines run in from the edge: protect the whole line width, not just the band
+        const xa = side === 'L' ? 0 : Math.round(LW * 0.55), xb = side === 'L' ? Math.round(LW * 0.45) : LW;
+        for (let x = xa; x < xb; x++) E[y * LW + x] += 50 * meanE;
+      }
+    }
+    void tband;
     fillPrevY = Y;
     if (!fillE || fillE.length !== n || cut) { fillE = E; fillSeamV = null; fillSeamH = null; }
     else {
@@ -1135,6 +1176,11 @@
       for (let x = LW - 1; x >= 0; x--) {
         const R = rows[x];
         path[x] = R[by];
+        // spread: the rows next to this seam get dearer for the next seams
+        for (let d = -CFG.fillSpreadPx; d <= CFG.fillSpreadPx; d++) {
+          const yy = by + d;
+          if (d && yy >= 0 && yy < h) E[R[yy] * LW + x] *= 1 + CFG.fillSpread * (1 - Math.abs(d) / (CFG.fillSpreadPx + 1));
+        }
         R.copyWithin(by, by + 1, h);
         if (x > 0) by += back[x * LH + by];
       }
@@ -1233,6 +1279,10 @@
         const R = idx[y], c = R[bx];
         const r = Math.min(LH - 1, Math.floor(srcRow[c][y]));
         seamV[r * LW + c] = 1;
+        for (let d = -CFG.fillSpreadPx; d <= CFG.fillSpreadPx; d++) {
+          const xx = bx + d;
+          if (d && xx >= 0 && xx < w) E2[y * LW + R[xx]] *= 1 + CFG.fillSpread * (1 - Math.abs(d) / (CFG.fillSpreadPx + 1));
+        }
         R.copyWithin(bx, bx + 1, w);
         if (y > 0) bx += back2[y * LW + bx];
       }

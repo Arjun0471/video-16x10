@@ -34,6 +34,7 @@ with sync_playwright() as p:
     if EXTRA_JS: pg.evaluate(EXTRA_JS)
     pg.evaluate(f"(async () => {{ const v = {V}; v.muted = true; await v.play(); }})()")
     pg.mouse.move(1900, 10)
+    if os.environ.get('DEBUG'): pg.keyboard.press('Alt+Shift+KeyZ')
     for k in range(n):
         time.sleep(2)
         st = pg.evaluate("window.__smart1610.state")
