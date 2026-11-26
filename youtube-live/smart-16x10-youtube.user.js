@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.5.0
+// @version      3.5.1
 // @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles smart / crop only / fill (never crops); in fill, Alt+W switches seams / smooth warp. Alt+Z on/off, Alt+Shift+Z debug with seam view.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,7 +27,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.5.0';
+  const VERSION = '3.5.1';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -58,6 +58,9 @@
                         // movements (a talking head) push row seams through the background (wavy logos)
     fillMotionMin: 28,  // ...ignoring changes below this (noise, compression, small talking movements)
     fillMotionDecay: 0.9, // ...remembered for a short while after they stop
+    skinW: 20,          // skin (faces, hands) counts as this much detail (x frame mean): no stretch there
+    skinMinY: 50, skinCr: [135, 175], skinCb: [80, 130], // YCbCr skin range
+    skinDilate: 2,      // grow the skin mask by this many analysis px (hairline, edges of the face)
     warpEps: 0.15,      // warp style: plainness weight = 1 / (detail + this x frame mean)
     warpMaxStretch: 1.0, // ...no spot stretched more than 2x
     warpMaxShrink: 0.5, // ...or narrowed to less than half
@@ -156,7 +159,7 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, fillStyle = store.get('fillStyle', 'seams') === 'warp' ? 'warp' : 'seams', seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, skinMask = null, skinShare = 0, fillStyle = store.get('fillStyle', 'seams') === 'warp' ? 'warp' : 'seams', seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
@@ -242,12 +245,13 @@
           vec2 mxp = texelFetch(fillB, clamp(c + ivec2(1, 0), ivec2(0), mx), 0).rg;
           vec2 myp = texelFetch(fillB, clamp(c + ivec2(0, 1), ivec2(0), mx), 0).rg;
           vec2 mym = texelFetch(fillB, clamp(c - ivec2(0, 1), ivec2(0), mx), 0).rg;
-          // inserted row: this output row steps only half a source row from a neighbour
-          bool ins = (myp.g - m0.g) < 0.75 / grid.y && c.y < mx.y || (m0.g - mym.g) < 0.75 / grid.y && c.y > 0;
-          // removed column: the next output column skips a source column
-          bool rem = (mxp.r - m0.r) > 1.5 / grid.x;
-          if (ins) o.rgb = mix(o.rgb, ROWCOL, 0.45);
-          if (rem) o.rgb = mix(o.rgb, COLCOL, 0.85);
+          // heat map: how much taller (green) / narrower (red) than the original
+          // each spot is drawn. 1 = untouched; an inserted seam row = 2.
+          float dy = c.y < mx.y ? (myp.g - m0.g) : (m0.g - mym.g);
+          float stretch = (1.0 / grid.y) / max(dy, 1e-5);
+          float narrow = c.x < mx.x ? (mxp.r - m0.r) * grid.x : 1.0;
+          o.rgb = mix(o.rgb, ROWCOL, clamp((stretch - 1.0) * 2.5, 0.0, 0.7));
+          o.rgb = mix(o.rgb, COLCOL, clamp((narrow - 1.0) * 2.5, 0.0, 0.8));
         }
         return;
       }
@@ -660,6 +664,7 @@
       const LW = aw * 2, LH = ah * 2, d2 = readAnalysis(LW, LH, 'learn'), n2 = LW * LH;
       const Y2 = new Float32Array(n2);
       for (let q = 0, j = 0; q < n2; q++, j += 4) Y2[q] = 0.299 * d2[j] + 0.587 * d2[j + 1] + 0.114 * d2[j + 2];
+      skinMask = detectSkin(d2, LW, LH);
       lastOv = learnOverlays(Y2, LW, LH, now, learnAcc);
       if (seamMode === 'fill') { updateFill(Y2, LW, LH, now, cut || fillCutPending); fillCutPending = false; }
       else updateSeams(Y2, LW, LH, now);
@@ -995,6 +1000,7 @@
     }
     const meanE = sum / n || 1;
     for (const r of ovActive || []) for (let y = r.y0; y < r.y1; y++) for (let x = r.x0; x < r.x1; x++) E[y * LW + x] += 1e4;
+    if (skinMask && skinMask.length === n) for (let q = 0; q < n; q++) if (skinMask[q]) E[q] += CFG.skinW * meanE;
     // Text found along a side edge (chat, HUD labels): seams must not pass between
     // its letters, which look empty at this resolution.
     const band = Math.round(CFG.textBand * LW);
@@ -1056,6 +1062,29 @@
     seamReady = carved > 0;                          // nothing carvable = plain crop
   }
 
+  // Skin (faces, hands, arms): smooth, so it looks "plain" to seams and warp
+  // and would get stretched. Standard YCbCr skin range, dilated a little.
+  function detectSkin(d, LW, LH) {
+    const n = LW * LH, m = new Uint8Array(n);
+    let cnt = 0;
+    for (let q = 0, j = 0; q < n; q++, j += 4) {
+      const r = d[j], g = d[j + 1], b = d[j + 2];
+      const y = 0.299 * r + 0.587 * g + 0.114 * b;
+      const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b, cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+      if (y > CFG.skinMinY && cr > CFG.skinCr[0] && cr < CFG.skinCr[1] && cb > CFG.skinCb[0] && cb < CFG.skinCb[1]) { m[q] = 1; cnt++; }
+    }
+    skinShare = cnt / n;
+    const R = CFG.skinDilate, out = new Uint8Array(n);
+    for (let y = 0; y < LH; y++) for (let x = 0; x < LW; x++) {
+      if (!m[y * LW + x]) continue;
+      for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && yy < LH && xx >= 0 && xx < LW) out[yy * LW + xx] = 1;
+      }
+    }
+    return out;
+  }
+
   // --------------------------------------------------------- fill mode
   // Never crop, never bars, never stretch: change the shape with seams in both
   // directions - insert rows along horizontal seams through plain areas and
@@ -1095,6 +1124,7 @@
     }
     const meanE = sum / n || 1;
     for (const r of ovActive || []) for (let y = r.y0; y < r.y1; y++) for (let x = r.x0; x < r.x1; x++) E[y * LW + x] += 50 * meanE;
+    if (skinMask && skinMask.length === n) for (let q = 0; q < n; q++) if (skinMask[q]) E[q] += CFG.skinW * meanE;
     // camera motion since the last learn frame
     let dx = 0, dy = 0;
     if (fillPrevY && fillPrevY.length === n && !cut) {
@@ -1815,13 +1845,14 @@
       L.push(`FILL never crops: shape changed with ${fillStyle === 'warp' ? 'a SMOOTH WARP' : 'SEAMS'} (Alt+W: seams / warp)`);
       if (fillInfo) {
         if (fillStyle === 'warp') {
-          L.push(`  green = stretched taller  -> height +${pct(fillInfo.heightAdded)}   (each column grows in its plainest parts)`);
-          L.push(`  red   = narrowed          -> width  -${pct(fillInfo.widthRemoved)}   (each row narrows in its plainest parts)`);
+          L.push(`  green = stretched taller  -> height +${pct(fillInfo.heightAdded)}   (each column grows in its plainest parts; stronger green = more)`);
+          L.push(`  red   = narrowed          -> width  -${pct(fillInfo.widthRemoved)}   (each row narrows in its plainest parts; stronger red = more)`);
         } else {
           L.push(`  green = rows INSERTED   ${String(fillInfo.kH).padStart(2)} row seams    -> height +${pct(fillInfo.heightAdded)}   (cheapest row seam: ${fillInfo.costH} of avg detail)`);
           L.push(`  red   = columns DELETED ${String(fillInfo.kW).padStart(2)} column seams -> width  -${pct(fillInfo.widthRemoved)}   (cheapest column seam: ${fillInfo.costV} of avg detail)`);
         }
         L.push(`  picture enlarged ${pct(1 / (1 - fillInfo.widthRemoved) - 1)} (only deleted width enlarges); split re-decided every ${CFG.fillSplitMs / 1000}s, seams follow the picture 10x/s`);
+        L.push(`  skin (faces, hands) protected: ${pct(skinShare)} of the frame`);
       } else L.push(`  computing seams...`);
     } else {
       const seamsOn = seamMix > 0.5;
