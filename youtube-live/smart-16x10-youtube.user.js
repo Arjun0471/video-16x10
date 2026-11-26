@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Smart 16:10 for YouTube
-// @version      3.5.2
+// @version      3.6.0
 // @description  Smart 16:9 -> 16:10 for YouTube. Alt+X cycles smart / crop only / fill (never crops); in fill, Alt+W switches seams / smooth warp. Alt+Z on/off, Alt+Shift+Z debug with seam view.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,7 +27,7 @@
   'use strict';
   if (window.__smart1610) return;
 
-  const VERSION = '3.5.2';
+  const VERSION = '3.6.0';
   const CFG = {
     aw: 160,           // analysis columns
     cropAccept: 0.2,    // crop unless it would cut > 20% of the frame's important content
@@ -62,11 +62,17 @@
     skinMinY: 50, skinCr: [135, 175], skinCb: [80, 130], // YCbCr skin range
     skinHeadUp: 0.6,    // also protect hair: this x the face's height above it
     skinDilate: 2,      // grow the skin mask by this many analysis px (hairline, edges of the face)
-    warpEps: 0.15,      // warp style: plainness weight = 1 / (detail + this x frame mean)
-    warpMaxStretch: 1.0, // ...no spot stretched more than 2x
+    warpEdgeK: 2.5,       // a horizontal edge this many x the average contrast, along a run, is kept straight (0 = off)
+    warpEdgeLen: 8,     // ...measured over +/- this many analysis columns
+    warpEdgeFade: 8,    // straightening fades out over this many rows above/below
+    warpEdgeBlur: 25,   // width of the averaging along the edge (analysis columns)
+    warpEps: 0.4,        // warp style: plainness weight = 1 / (detail + this x frame mean)
+    warpMaxStretch: 0.5, // ...no spot stretched more than 1.5x
     warpMaxShrink: 0.5, // ...or narrowed to less than half
-    warpSmoothX: 6,     // ...smoothing across neighbouring columns (analysis px): lines bend gently, never step
-    warpSmoothY: 2,     // ...and along each column
+    warpSmoothX: 10,    // ...smoothing across neighbouring columns (analysis px): lines bend gently, never step
+    warpSmoothY: 4,     // ...and along each column
+    seamSpread: 0.25,   // smart mode: each removed seam adds this x frame-mean detail to its neighbours...
+    seamSpreadPx: 3,    // ...within this many analysis px, so seams spread out instead of bunching
     fillSpread: 1.0,    // each chosen seam multiplies its neighbours' cost by up to (1 + this): plain areas stay
                         // cheap (bunching there is invisible), textured areas fill up fast and seams spread
     fillSpreadPx: 2,    // ...within this many analysis pixels, so seams spread out instead of bunching
@@ -133,7 +139,7 @@
     set(k, v) { try { localStorage.setItem('smart1610.' + k, v); } catch { /* ignore */ } },
   };
   let enabled = store.get('enabled', '1') === '1';
-  let seamMode = ['crop', 'fill'].includes(store.get('mode', 'smart')) ? store.get('mode', 'smart') : 'smart';
+  let seamMode = store.get('mode', 'smart') === 'fill' ? 'fill' : 'smart';
   let debug = false;
 
   const style = document.createElement('style');
@@ -160,7 +166,7 @@
   let toastEl = null, toastTimer = 0, dbgEl = null, dbgCanvas = null, dbgMini = null, frameHandle = 0;
   let prevY = null, prevHist = null, acc = null, prior = null, lastT = 0;
   let k = null, lay = null, held = null, warpMin = 1, camScore = 0.5, camMoving = true, camRef = [], shotT = 0, lastMoveT = 0,
-      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, skinMask = null, skinShare = 0, fillStyle = store.get('fillStyle', 'seams') === 'warp' ? 'warp' : 'seams', seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
+      ovRef = [], ovPix = null, ovInf = 0, ovPixF = null, ovInfF = 0, ovStill = null, ovRects = [], ovMask = null, ovActive = [], lastCutT = -1e9, ovMoments = 0, ovDims = [0, 0], hudUntil = 0, ovMomentsAtCut = 0, seamTex = null, seamReady = false, seamShotDone = false, seamSnap = false, seamMix = 0, seamMixT = 0, seamW = 0, seamH = 0, seamCarved = 0, seamK = 0, seamCL = 0, seamCR = 0, fillTex = [null, null], fillSize = [[1, 1], [1, 1]], fillCur = 0, fillReady = false, fillT = 0, fillLastT = 0, fillE = null, fillPrevY = null, fillSeamV = null, fillSeamH = null, fillInfo = null, fillCutPending = false, fillKH = -1, fillKW = -1, fillSplitT = 0, fillLF = 0, fillMot = null, fillY = null, skinMask = null, skinShare = 0, fillStyle = store.get('fillStyle', 'seams') === 'warp' ? 'warp' : 'seams', seamStillT = 0, seamPrevMoving = true, seamLog = [], motAcc = null, prevY2 = null, textMem = {}, textLastY = {}, textProt = { L: false, R: false, flipT: -1e9 }, ovKey = null, ovSaveT = 0, ovCells = 0, ovInfo = null, protNow = null, snap = true, cuts = 0, fill = 1, ok = true, active = false;
   const map = new Float32Array(CFG.mapN);
 
   window.__smart1610 = {
@@ -1046,7 +1052,17 @@
       seamLog.push(+(bm / LH / meanE).toFixed(3));
       if (bm / LH > CFG.seamMaxE * meanE) break;     // no more empty paths: crop the rest
       for (let y = LH - 1; y >= 0; y--) { path[y] = bx; if (y > 0) bx += back[y * LW + bx]; }
-      for (let y = 0; y < LH; y++) { const row = idx[y]; row.copyWithin(path[y], path[y] + 1, w); }
+      // make the next seams keep their distance (flat areas would otherwise
+      // collect every seam in one strip and wipe out whatever is in it)
+      const sp = CFG.seamSpreadPx, add = CFG.seamSpread * meanE;
+      for (let y = 0; y < LH; y++) {
+        const row = idx[y];
+        for (let dd = -sp; dd <= sp; dd++) {
+          const xx = path[y] + dd;
+          if (dd && xx >= 0 && xx < w) E[y * LW + row[xx]] += add * (1 - Math.abs(dd) / (sp + 1));
+        }
+        row.copyWithin(path[y], path[y] + 1, w);
+      }
       w--;
     }
     // the rest of the removal: crop from the edges (respecting chat protection)
@@ -1127,6 +1143,7 @@
 
   function updateFill(Y, LW, LH, now, cut) {
     const n = LW * LH;
+    fillY = Y;
     // energy: local detail + overlays/HUD/edge text kept intact
     const E = new Float32Array(n);
     let sum = 0;
@@ -1393,6 +1410,49 @@
     }
     return out;
   }
+  // Long straight horizontal edges (a desk, a sign, a table top) go wavy when
+  // neighbouring columns push them down by different amounts. Where such an
+  // edge is, make the push the same along it (blend toward a wide horizontal
+  // average), fading out over a few rows above and below.
+  function straightenEdges(D, LW, LH, prot) {
+    const Y = fillY;
+    if (!CFG.warpEdgeK || !Y || Y.length !== LW * LH) return;
+    const G = new Float32Array(LW * (LH + 1));
+    let mg = 0;
+    for (let y = 1; y < LH; y++) for (let x = 0; x < LW; x++) {    // across 2 rows: soft edges count
+      const g = Math.abs(Y[Math.min(LH - 1, y) * LW + x] - Y[Math.max(0, y - 2) * LW + x]); G[y * LW + x] = g; mg += g;
+    }
+    mg = mg / (LW * (LH - 1)) + 1e-3;
+    // straight + long: average strength over a horizontal window
+    const R = CFG.warpEdgeLen, H = new Float32Array(LW * (LH + 1)), pre = new Float32Array(LW + 1);
+    for (let y = 1; y < LH; y++) {
+      for (let x = 0; x < LW; x++) pre[x + 1] = pre[x] + G[y * LW + x];
+      for (let x = 0; x < LW; x++) {
+        const a = Math.max(0, x - R), b = Math.min(LW, x + R + 1);
+        const m = (pre[b] - pre[a]) / (b - a);
+        let h = Math.min(1, Math.max(0, m / (mg * CFG.warpEdgeK) - 1));
+        if (prot && (prot[y * LW + x] > 0.3 || prot[(y - 1) * LW + x] > 0.3)) h = 0;
+        H[y * LW + x] = h;
+      }
+    }
+    // fade out above/below the edge so the change is spread over rows
+    const V = CFG.warpEdgeFade, H2 = new Float32Array(LW * (LH + 1));
+    for (let y = 1; y < LH; y++) for (let x = 0; x < LW; x++) {
+      let h = 0;
+      for (let d = -V; d <= V; d++) {
+        const yy = y + d;
+        if (yy > 0 && yy < LH) h = Math.max(h, H[yy * LW + x] * (1 - Math.abs(d) / (V + 1)));
+      }
+      H2[y * LW + x] = h;
+    }
+    const Ds = blurGrid(D, LW, LH + 1, CFG.warpEdgeBlur, 0.01);
+    for (let q = LW; q < LW * LH; q++) if (H2[q] > 0) D[q] += H2[q] * (Ds[q] - D[q]);
+    for (let x = 0; x < LW; x++) {                    // keep it monotone and inside the column
+      const end = D[LH * LW + x];
+      for (let y = 1; y <= LH; y++) D[y * LW + x] = Math.min(end, Math.max(D[y * LW + x], D[(y - 1) * LW + x]));
+    }
+  }
+
   // spread `total` over cells in proportion to weights, no cell above `cap`
   function distribute(total, wts, cap, out) {
     const m = wts.length;
@@ -1432,15 +1492,22 @@
       prot = blurGrid(P, LW, LH, 2, 2);
       for (let q = 0; q < P.length; q++) S[q] *= Math.max(0, 1 - 1.6 * prot[q]);
     }
-    const H2 = LH + kH, rowMap = new Float32Array(LW * H2);
+    // D(x, y) = how far source row boundary y moves down in column x
+    const D = new Float32Array(LW * (LH + 1));
     for (let x = 0; x < LW; x++) {
       let t = 0;
       for (let y = 0; y < LH; y++) t += S[y * LW + x];
       const k = t > 0 ? kH / t : 0;
-      let b = 0, y = 0, sy = 1 + S[x] * k;
+      let acc = 0;
+      for (let y = 0; y < LH; y++) { acc += S[y * LW + x] * k; D[(y + 1) * LW + x] = acc; }
+    }
+    straightenEdges(D, LW, LH, prot);
+    const H2 = LH + kH, rowMap = new Float32Array(LW * H2);
+    for (let x = 0; x < LW; x++) {
+      let b = 0, y = 0, sy = 1 + D[LW + x] - D[x];
       for (let j = 0; j < H2; j++) {
         const c = j + 0.5;
-        while (y < LH - 1 && b + sy < c) { b += sy; y++; sy = 1 + S[y * LW + x] * k; }
+        while (y < LH - 1 && b + sy < c) { b += sy; y++; sy = 1 + D[(y + 1) * LW + x] - D[y * LW + x]; }
         rowMap[j * LW + x] = Math.min(LH, y + Math.min(1, (c - b) / sy));
       }
     }
@@ -1865,7 +1932,7 @@
     const n0 = k.length;
     const pct = (v) => `${(100 * v).toFixed(1)}%`;
     const L = [];
-    L.push(`16:10 v${VERSION}   mode ${{ smart: 'SMART', crop: 'CROP ONLY', fill: 'FILL' }[seamMode]}  (Alt+X: smart / crop / fill)   camera ${camMoving ? 'moving' : 'still'}   cuts ${cuts}`);
+    L.push(`16:10 v${VERSION}   mode ${{ smart: 'SMART', fill: 'FILL' }[seamMode]}  (Alt+X: smart / fill)   camera ${camMoving ? 'moving' : 'still'}   cuts ${cuts}`);
     if (seamMode === 'fill') {
       L.push(`FILL never crops: shape changed with ${fillStyle === 'warp' ? 'a SMOOTH WARP' : 'SEAMS'} (Alt+W: seams / warp)`);
       if (fillInfo) {
@@ -1934,12 +2001,12 @@
       toast(`16:10 fill style: ${fillStyle === 'warp' ? 'smooth warp' : 'seams'}${seamMode === 'fill' ? '' : ' (applies in fill mode)'}`);
       return;
     }
-    if (e.code === 'KeyX') {                        // smart (seams on still shots) <-> crop only
-      seamMode = seamMode === 'smart' ? 'crop' : seamMode === 'crop' ? 'fill' : 'smart';
+    if (e.code === 'KeyX') {                        // smart (seams on still shots) <-> fill
+      seamMode = seamMode === 'smart' ? 'fill' : 'smart';
       store.set('mode', seamMode);
       if (seamMode === 'smart') seamShotDone = false;
       if (seamMode === 'fill') { fillReady = false; fillE = null; }
-      toast(`16:10 mode: ${{ smart: 'smart (seams on still shots)', crop: 'crop only', fill: 'fill (never crops)' }[seamMode]}`);
+      toast(`16:10 mode: ${{ smart: 'smart (seams on still shots)', fill: 'fill (never crops)' }[seamMode]}`);
       return;
     }
     if (e.shiftKey) {
